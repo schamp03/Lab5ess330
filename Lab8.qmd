@@ -1,0 +1,211 @@
+---
+title: "hyperparameter-tuning"
+format: 
+  html:
+    self-contained: true
+editor: visual
+---
+
+```{r}
+#load in packages
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(patchwork)
+library(powerjoin)
+
+```
+
+# Data Import/ Tidy/ Transform
+```{r}
+# read in data
+# Example skeleton
+data_files <- list.files("data/", pattern = "*.txt", full.names = TRUE)
+camels_raw <- map(data_files, read_delim) %>% 
+  reduce(power_full_join)
+
+# Clean the data
+camels_clean <- camels_raw %>%
+  filter(!is.na(q_mean)) %>%
+  select(-gauge_id) %>%  
+  mutate_if(is.character, as.factor)
+
+```
+
+# Data Splitting
+```{r}
+# Split Data using 80% and 20% for testing
+set.seed(123)
+camels_split <- initial_split(camels_clean, prop = 0.8)
+train_data <- training(camels_split)
+test_data <- testing(camels_split)
+
+
+```
+
+# Feature Engineering
+```{r}
+# Recipe
+camels_rec <- recipe(q_mean ~ ., data = train_data) %>%
+  step_rm(gauge_lat, gauge_lon) %>%
+  step_unknown(all_nominal_predictors()) %>%        # handles NA levels in factors
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%                     # removes zero-variance predictors
+  step_normalize(all_numeric_predictors())
+
+
+```
+
+# Resampling and Model Testing
+```{r}
+# Build resample
+set.seed(123)
+folds <- vfold_cv(train_data, v = 10)
+
+```
+
+# Build 3 Cadidate Models
+```{r}
+# Define 3 Models
+lm_mod <- linear_reg() %>% set_engine("lm") %>% set_mode("regression")
+rf_mod <- rand_forest() %>% set_engine("ranger") %>% set_mode("regression")
+xgb_mod <- boost_tree() %>% set_engine("xgboost") %>% set_mode("regression")
+
+# Create a model set
+model_set <- workflow_set(
+  preproc = list(camels_rec),
+  models = list(
+    "Linear Model" = lm_mod,
+    "Random Forest" = rf_mod,
+    "XGBoost" = xgb_mod
+  )
+)
+
+# Fit resamples
+set.seed(123)
+model_results <- model_set %>%
+  workflow_map("fit_resamples", resamples = folds)
+
+# Visualize
+autoplot(model_results)
+
+
+```
+
+# Test the Models
+```{r}
+# Test three models
+model_set <- workflow_set(
+  preproc = list(camels_rec),
+  models = list("Linear" = lm_mod, "RandomForest" = rf_mod, "XGBoost" = xgb_mod)
+)
+
+model_results <- model_set %>%
+  workflow_map("fit_resamples", resamples = folds)
+
+#visualization
+autoplot(model_results)
+
+```
+
+# Model Selection
+## Based on the visualized metrics, select a model that you think best performs. Describe the reason for your choice using the metrics.
+Out of the three models I tested, the linear regression model performed the best. It had the lowest RMSE, which means its predictions were the closest to the actual values on average. It also had the highest R² value, showing that it explained more of the variation in q_mean than the other models. Compared to the boosted tree and random forest, the linear model was also the most consistent across the cross-validation folds, with less variability in its performance.
+
+## Describe the model you selected. What is the model type, engine, and mode. Why do you think it is performing well for this problem?
+The model I chose is a linear regression model using the "lm" engine in regression mode. I think it worked well here because the relationships between the predictors and the target variable seem to be pretty linear. The recipe we used helped clean and prepare the data, including normalizing numeric variables and converting categorical ones into dummy variables, which probably helped the model pick up on patterns more effectively. Overall, it’s a simple model, but it ended up being the most accurate and reliable for this dataset.
+
+# Model Tuning
+```{r}
+# Define a tunable model with two hyperparameters
+xgb_tune <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  mtry = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+```
+
+# Create a Workflow
+```{r}
+#Create workflow object
+wf_tune <- workflow() %>%
+  add_model(xgb_tune) %>%
+  add_recipe(camels_rec)
+
+```
+
+#Check the Tunable Values/ Ranges
+```{r}
+dials <- extract_parameter_set_dials(wf_tune)
+
+dials <- finalize(dials, train_data)
+
+
+my.grid <- grid_latin_hypercube(dials, size = 25)
+show_notes(.Last.tune.result)
+
+small_grid <- grid_latin_hypercube(
+  finalize(extract_parameter_set_dials(wf_tune), train_data),
+  size = 3
+)
+
+model_params <- tune_grid(
+  wf_tune,
+  resamples = folds,
+  grid = small_grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+autoplot(model_params)
+
+#Collect results
+collect_metrics(model_params)
+show_best(model_params, metric = "mae")
+hp_best <- select_best(model_params, metric = "mae")
+
+```
+
+
+```{r}
+# Final Model Verification
+final_wf <- finalize_workflow(wf_tune, hp_best)
+
+# Verification
+final_fit <- last_fit(final_wf, split = camels_split)
+
+collect_metrics(final_fit)
+collect_predictions(final_fit) %>%
+  ggplot(aes(x = .pred, y = q_mean)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Predicted", y = "Observed", title = "Prediction vs Actual")
+
+```
+
+
+```{r}
+#Mapping 
+final_model_fit <- fit(final_wf, data = camels_clean)
+
+camels_aug <- augment(final_model_fit, new_data = camels_clean) %>%
+  mutate(residuals_sq = (.pred - q_mean)^2)
+
+map_pred <- ggplot(camels_aug, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(size = 2) + coord_fixed() +
+  scale_color_viridis_c() + labs(title = "Predicted q_mean")
+
+map_resid <- ggplot(camels_aug, aes(x = gauge_lon, y = gauge_lat, color = residuals_sq)) +
+  geom_point(size = 2) + coord_fixed() +
+  scale_color_viridis_c() + labs(title = "Residuals")
+
+map_pred + map_resid
+
+```
+
